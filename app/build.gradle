@@ -5,11 +5,11 @@ plugins {
 }
 
 android {
-    namespace 'dev.camera.sandbox'
+    namespace 'dev.video.sandbox'
     compileSdk 33
 
     defaultConfig {
-        applicationId "dev.camera.sandbox"
+        applicationId "dev.video.sandbox"
         minSdk 21
         targetSdk 29
         versionCode 1
