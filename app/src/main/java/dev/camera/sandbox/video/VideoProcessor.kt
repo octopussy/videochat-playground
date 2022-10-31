@@ -167,6 +167,11 @@ class VideoProcessor(
 
     private val newFrameAvailableLock = Channel<Unit>()
 
+    private var inputWidth = 0
+    private var inputHeight = 0
+    private var outputWidth = 0
+    private var outputHeight = 0
+
     @Volatile
     private var outputVideoFormat: MediaFormat? = null
 
@@ -282,6 +287,11 @@ class VideoProcessor(
         val videoInfo = extractor.pickMediaTrackInfo("video/")
             ?: throw IllegalStateException("Missing video track for '$inputUri'")
 
+        inputWidth = videoInfo.format.getInteger(MediaFormat.KEY_WIDTH)
+        inputHeight = videoInfo.format.getInteger(MediaFormat.KEY_HEIGHT)
+        outputWidth = ENCODE_WIDTH
+        outputHeight = ENCODE_HEIGHT
+
         val totalDurationUs = videoInfo.format.getLong(MediaFormat.KEY_DURATION)
 
         videoRotationDeg = videoInfo.format.getRotationDeg()
@@ -305,8 +315,8 @@ class VideoProcessor(
         val desiredOutputVideoFormat =
             MediaFormat.createVideoFormat(
                 MediaFormat.MIMETYPE_VIDEO_AVC,
-                ENCODE_WIDTH,
-                ENCODE_HEIGHT
+                outputWidth,
+                outputHeight
             ).apply {
                 setInteger(MediaFormat.KEY_BIT_RATE, ENCODE_BITRATE)
                 setInteger(MediaFormat.KEY_FRAME_RATE, ENCODE_MAX_FRAME_RATE)
@@ -315,7 +325,6 @@ class VideoProcessor(
                     MediaFormat.KEY_COLOR_FORMAT,
                     MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
                 )
-                //setInteger(MediaFormat.KEY_BITRATE_MODE, EncoderCapabilities.BITRATE_MODE_CBR)
             }
 
         muxer = MediaMuxer(outputFile.absolutePath, OutputFormat.MUXER_OUTPUT_MPEG_4)
@@ -345,7 +354,7 @@ class VideoProcessor(
                     }
                 }
             }
-            setDefaultBufferSize(ENCODE_WIDTH, ENCODE_HEIGHT)
+            setDefaultBufferSize(outputWidth, outputHeight)
         }
 
         inputSurface = Surface(inputTexture)
@@ -529,7 +538,7 @@ class VideoProcessor(
             }
 
             encoderWindowSurface!!.makeCurrent()
-            GLES20.glViewport(0, 0, ENCODE_WIDTH, ENCODE_HEIGHT)
+            GLES20.glViewport(0, 0, outputWidth, outputHeight)
 
             frameBlit!!.drawFrameY(inputTextureId, tempMatrix, videoRotationDeg, 1f)
             encoderWindowSurface!!.setPresentationTime(inputTexture!!.timestamp)
@@ -539,7 +548,8 @@ class VideoProcessor(
                 synchronized(takeSnapshotCallbackLock) {
                     if (takeSnapshotCallback != null) {
                         Thread.sleep(50)
-                        val bmp = makeBitmapFromGlPixels(ENCODE_WIDTH, ENCODE_HEIGHT, videoRotationDeg)
+                        val bmp =
+                            makeBitmapFromGlPixels(outputWidth, outputHeight, videoRotationDeg)
                         takeSnapshotCallback?.invoke(bmp)
                         takeSnapshotCallback = null
                     }
