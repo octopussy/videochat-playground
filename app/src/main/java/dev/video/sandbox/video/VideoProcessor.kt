@@ -21,6 +21,7 @@ import grafika.gles.Texture2dProgram
 import grafika.gles.WindowSurface
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
@@ -30,6 +31,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.nio.ByteBuffer
+import java.util.concurrent.Executors
 
 
 sealed interface VideoProcessingState {
@@ -166,6 +168,7 @@ class VideoProcessor(
     )
 
     private val newFrameAvailableLock = Channel<Unit>()
+    private val newFrameAvailableLock2 = Channel<Unit>()
 
     private var inputWidth = 0
     private var inputHeight = 0
@@ -281,252 +284,273 @@ class VideoProcessor(
         // TODO
     }
 
+    private val primaryDispatcher = Executors.newFixedThreadPool(1).asCoroutineDispatcher()
+
     fun process() = channelFlow<VideoProcessingState> {
-        val startTime = System.currentTimeMillis()
+        withContext(primaryDispatcher) {
+            val startTime = System.currentTimeMillis()
 
-        val videoInfo = extractor.pickMediaTrackInfo("video/")
-            ?: throw IllegalStateException("Missing video track for '$inputUri'")
+            for (i in 0 until extractor.trackCount) {
+                dumpTrack(extractor, i)
+            }
+            val videoInfo = extractor.pickMediaTrackInfo("video/")
+                ?: throw IllegalStateException("Missing video track for '$inputUri'")
 
-        inputWidth = videoInfo.format.getInteger(MediaFormat.KEY_WIDTH)
-        inputHeight = videoInfo.format.getInteger(MediaFormat.KEY_HEIGHT)
-        outputWidth = ENCODE_WIDTH
-        outputHeight = ENCODE_HEIGHT
+            inputWidth = videoInfo.format.getInteger(MediaFormat.KEY_WIDTH)
+            inputHeight = videoInfo.format.getInteger(MediaFormat.KEY_HEIGHT)
+            outputWidth = ENCODE_WIDTH
+            outputHeight = ENCODE_HEIGHT
 
-        val totalDurationUs = videoInfo.format.getLong(MediaFormat.KEY_DURATION)
+            val totalDurationUs = videoInfo.format.getLong(MediaFormat.KEY_DURATION)
 
-        videoRotationDeg = videoInfo.format.getRotationDeg()
+            videoRotationDeg = videoInfo.format.getRotationDeg()
 
-        extractor.selectTrack(videoInfo.trackIndex)
+            extractor.selectTrack(videoInfo.trackIndex)
 
-        val audioInfo = if (withAudio) {
-            extractor.pickMediaTrackInfo("audio/")?.also {
-                extractor.selectTrack(it.trackIndex)
-            } ?: throw IllegalStateException("Missing audio track for '$inputUri'")
-        } else {
-            null
-        }
-
-        var outAudioTrackIndex: Int? = null
-        var outVideoTrackIndex: Int? = null
-        if (audioInfo != null) {
-            outAudioTrackIndex = muxer.addTrack(audioInfo.format)
-        }
-
-        val desiredOutputVideoFormat =
-            MediaFormat.createVideoFormat(
-                MediaFormat.MIMETYPE_VIDEO_AVC,
-                outputWidth,
-                outputHeight
-            ).apply {
-                setInteger(MediaFormat.KEY_BIT_RATE, ENCODE_BITRATE)
-                setInteger(MediaFormat.KEY_FRAME_RATE, ENCODE_MAX_FRAME_RATE)
-                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, ENCODE_I_FRAME_INTERVAL)
-                setInteger(
-                    MediaFormat.KEY_COLOR_FORMAT,
-                    MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
-                )
+            val audioInfo = if (withAudio) {
+                extractor.pickMediaTrackInfo("audio/")?.also {
+                    extractor.selectTrack(it.trackIndex)
+                } ?: throw IllegalStateException("Missing audio track for '$inputUri'")
+            } else {
+                null
             }
 
-        muxer = MediaMuxer(outputFile.absolutePath, OutputFormat.MUXER_OUTPUT_MPEG_4)
-        encoder = MediaCodec.createByCodecName(selectCodec(ENCODE_MIME)!!.name)
+            var outAudioTrackIndex: Int? = null
+            var outVideoTrackIndex: Int? = null
+            if (audioInfo != null) {
+                outAudioTrackIndex = muxer.addTrack(audioInfo.format)
+            }
 
-        eglCore = EglCore(null, EglCore.FLAG_RECORDABLE)
-        encoder.setCallback(encoderCallback)
-        encoder.configure(desiredOutputVideoFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-        encoderSurface = encoder.createInputSurface()
-        encoderWindowSurface = WindowSurface(eglCore, encoderSurface, false)
-        encoderWindowSurface!!.makeCurrent()
-        encoder.start()
-
-        frameBlit = FullFrameRectLetterbox(
-            Texture2dProgram(Texture2dProgram.ProgramType.TEXTURE_EXT)
-        )
-
-        inputTextureId = frameBlit!!.createTextureObject()
-        inputTexture = SurfaceTexture(inputTextureId).apply {
-            setOnFrameAvailableListener { surfaceTexture ->
-                scope.launch(Dispatchers.Main) {
-                    if (outputVideoFormat == null) {
-                        LOGE("onInputFrameAvailable ${surfaceTexture.timestamp} NO FORMAT")
-                        renderVideoFrame()
-                    } else {
-                        newFrameAvailableLock.send(Unit)
-                    }
+            val desiredOutputVideoFormat =
+                MediaFormat.createVideoFormat(
+                    MediaFormat.MIMETYPE_VIDEO_AVC,
+                    outputWidth,
+                    outputHeight
+                ).apply {
+                    setInteger(MediaFormat.KEY_BIT_RATE, ENCODE_BITRATE)
+                    setInteger(MediaFormat.KEY_FRAME_RATE, ENCODE_MAX_FRAME_RATE)
+                    setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, ENCODE_I_FRAME_INTERVAL)
+                    setInteger(
+                        MediaFormat.KEY_COLOR_FORMAT,
+                        MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
+                    )
                 }
-            }
-            setDefaultBufferSize(outputWidth, outputHeight)
-        }
 
-        inputSurface = Surface(inputTexture)
-        decoder = MediaCodec.createDecoderByType(videoInfo.mime)
-        decoder.setCallback(decoderCallback)
-        decoder.configure(videoInfo.format, inputSurface, null, 0)
-        decoder.start()
+            muxer = MediaMuxer(outputFile.absolutePath, OutputFormat.MUXER_OUTPUT_MPEG_4)
+            encoder = MediaCodec.createByCodecName(selectCodec(ENCODE_MIME)!!.name)
 
-        val buffer = ByteBuffer.allocate(0xffffff)
+            eglCore = EglCore(null, EglCore.FLAG_RECORDABLE)
+            encoder.setCallback(encoderCallback)
+            encoder.configure(
+                desiredOutputVideoFormat,
+                null,
+                null,
+                MediaCodec.CONFIGURE_FLAG_ENCODE
+            )
+            encoderSurface = encoder.createInputSurface()
+            encoderWindowSurface = WindowSurface(eglCore, encoderSurface, false)
+            encoderWindowSurface!!.makeCurrent()
+            encoder.start()
 
-        var videoFramesWritten = 0
-        var bytesWritten = 0L
-        var videoFramesRead = 0
-        var audioFramesRead = 0
-        var audioFramesWritten = 0
+            frameBlit = FullFrameRectLetterbox(
+                Texture2dProgram(Texture2dProgram.ProgramType.TEXTURE_EXT)
+            )
 
-        var isEncoderFinished = false
-        var isDecoderFinished = false
-
-        coroutineScope {
-            var thumbnailBitmap: Bitmap? = null
-            takeSnapshotCallback = {
-                thumbnailBitmap = it
-            }
-
-            // Feed decoder
-            launch(Dispatchers.IO) {
-                while (true) {
-                    val dataSize = extractor.readSampleData(buffer, 0)
-                    if (dataSize == -1) {
-                        LOGD("[EXTRACTOR] COMPLETE")
-                        sendFinishToDecoder()
-                        break
-                    }
-
-                    val trackIndex = extractor.sampleTrackIndex
-                    val presentationTimeUs = extractor.sampleTime
-
-                    if (trackIndex == videoInfo.trackIndex) {
-                        submitDataToDecoder(buffer, dataSize, presentationTimeUs)
-                        ++videoFramesRead
-                    } else if (audioInfo != null && outAudioTrackIndex != null && trackIndex == audioInfo.trackIndex) {
-                        val audioBufferInfo = BufferInfo().apply {
-                            this.presentationTimeUs = presentationTimeUs
-                            this.size = dataSize
-                        }
-                        ++audioFramesRead
-                        audioFrames.send(AudioFrame(buffer.deepCopyData(), audioBufferInfo))
-                    }
-
-                    extractor.advance()
-                }
-            }
-
-            // Write audio
-            if (withAudio) {
-                launch(Dispatchers.IO) {
-                    while (!isDecoderFinished) {
-                        val audioFrame = audioFrames.tryReceive().getOrNull()
-                        if (audioFrame != null && isMuxerStarted && outAudioTrackIndex != null) {
-                            muxer.writeSampleData(
-                                outAudioTrackIndex,
-                                audioFrame.buffer,
-                                audioFrame.info
-                            )
-                            ++audioFramesWritten
-                        } else {
-                            LOGE("AUDIO DELAY")
-                            delay(10)
-                        }
-                    }
-                }
-            }
-
-            // Main worker
-            launch(Dispatchers.IO) {
-                while (!isEncoderFinished) {
-                    if (!isDecoderFinished) {
-                        var doRender = false
-                        when (val decodedFrame = decodedVideoFrames.receive()) {
-                            is DecodedVideoFrame.Data -> {
-                                LOGD(
-                                    "decodedFrame:  data = ${decodedFrame.info.size} " +
-                                            "${decodedFrame.info.presentationTimeUs}"
-                                )
-                                decodedFrame.codec.releaseOutputBuffer(decodedFrame.index, true)
-                                doRender = true
-                            }
-
-                            DecodedVideoFrame.Finished -> {
-                                LOGD("decodedFrame:  finish!")
-                                isDecoderFinished = true
-                                encoder.signalEndOfInputStream()
-                            }
-                        }
-
+            inputTextureId = frameBlit!!.createTextureObject()
+            inputTexture = SurfaceTexture(inputTextureId).apply {
+                setOnFrameAvailableListener { surfaceTexture ->
+                    scope.launch(Dispatchers.Main) {
                         if (outputVideoFormat == null) {
-                            LOGD("WAITING RESULT VIDEO FORMAT")
-                            delay(100)
-                            continue
-                        } else if (outVideoTrackIndex == null) {
-                            LOGD("[ENCODER] Config frame. Add output video track.")
-                            outVideoTrackIndex = muxer.addTrack(outputVideoFormat!!)
-                            muxer.setOrientationHint(videoRotationDeg)
-                            muxer.start()
-                            isMuxerStarted = true
+                            LOGE("onInputFrameAvailable ${surfaceTexture.timestamp} NO FORMAT")
+                            newFrameAvailableLock2.send(Unit)
+                        } else {
+                            newFrameAvailableLock.send(Unit)
+                        }
+                    }
+                }
+                setDefaultBufferSize(outputWidth, outputHeight)
+            }
+
+            inputSurface = Surface(inputTexture)
+            decoder = MediaCodec.createDecoderByType(videoInfo.mime)
+            decoder.setCallback(decoderCallback)
+            decoder.configure(videoInfo.format, inputSurface, null, 0)
+            decoder.start()
+
+            val buffer = ByteBuffer.allocate(0xffffff)
+
+            var videoFramesWritten = 0
+            var bytesWritten = 0L
+            var videoFramesRead = 0
+            var audioFramesRead = 0
+            var audioFramesWritten = 0
+
+            var isEncoderFinished = false
+            var isDecoderFinished = false
+
+            coroutineScope {
+                var thumbnailBitmap: Bitmap? = null
+                takeSnapshotCallback = {
+                    thumbnailBitmap = it
+                }
+
+                // Feed decoder
+                launch(Dispatchers.IO) {
+                    while (true) {
+                        val dataSize = extractor.readSampleData(buffer, 0)
+                        if (dataSize == -1) {
+                            LOGD("[EXTRACTOR] COMPLETE")
+                            sendFinishToDecoder()
+                            break
                         }
 
-                        if (doRender) {
-                            newFrameAvailableLock.receive()
-                            withContext(Dispatchers.Main) {
-                                renderVideoFrame()
+                        val trackIndex = extractor.sampleTrackIndex
+                        val presentationTimeUs = extractor.sampleTime
+
+                        if (trackIndex == videoInfo.trackIndex) {
+                            submitDataToDecoder(buffer, dataSize, presentationTimeUs)
+                            ++videoFramesRead
+                        } else if (audioInfo != null && outAudioTrackIndex != null && trackIndex == audioInfo.trackIndex) {
+                            val audioBufferInfo = BufferInfo().apply {
+                                this.presentationTimeUs = presentationTimeUs
+                                this.size = dataSize
+                            }
+                            ++audioFramesRead
+                            audioFrames.send(AudioFrame(buffer.deepCopyData(), audioBufferInfo))
+                        }
+
+                        extractor.advance()
+                    }
+                }
+
+                // Write audio
+                if (withAudio) {
+                    launch(Dispatchers.IO) {
+                        while (!isDecoderFinished) {
+                            val audioFrame = audioFrames.tryReceive().getOrNull()
+                            if (audioFrame != null && isMuxerStarted && outAudioTrackIndex != null) {
+                                muxer.writeSampleData(
+                                    outAudioTrackIndex,
+                                    audioFrame.buffer,
+                                    audioFrame.info
+                                )
+                                ++audioFramesWritten
+                            } else {
+                                LOGE("AUDIO DELAY")
+                                delay(10)
                             }
                         }
                     }
+                }
 
-                    while (true) {
-                        val frame = encodedVideoFrames.tryReceive().getOrNull() ?: break
-                        LOGE("ENCODED FRAME: $frame")
-                        when (frame) {
-                            EncodedVideoFrame.EndOfData -> {
-                                isEncoderFinished = true
-                                LOGD("[ENCODER-MUXER] COMPLETE")
+                // Main worker
+                launch(Dispatchers.IO) {
+                    while (!isEncoderFinished) {
+                        if (!isDecoderFinished) {
+                            var doRender = false
+                            when (val decodedFrame = decodedVideoFrames.receive()) {
+                                is DecodedVideoFrame.Data -> {
+                                    LOGD(
+                                        "decodedFrame:  data = ${decodedFrame.info.size} " +
+                                                "${decodedFrame.info.presentationTimeUs}"
+                                    )
+                                    decodedFrame.codec.releaseOutputBuffer(decodedFrame.index, true)
+                                    doRender = true
+                                }
+
+                                DecodedVideoFrame.Finished -> {
+                                    LOGD("decodedFrame:  finish!")
+                                    isDecoderFinished = true
+                                    encoder.signalEndOfInputStream()
+                                }
                             }
 
-                            is EncodedVideoFrame.DataFrame -> {
-                                val bi = BufferInfo().apply {
-                                    presentationTimeUs = frame.info.presentationTimeUs
-                                    size = frame.info.size
-                                    flags = frame.info.flags
-                                    offset = frame.info.offset
+                            if (outputVideoFormat == null) {
+                                LOGD("WAITING RESULT VIDEO FORMAT")
+                                //delay(100)
+                                newFrameAvailableLock2.receive()
+                                withContext(primaryDispatcher) {
+                                    renderVideoFrame()
                                 }
-                                val trackIndex = outVideoTrackIndex
-                                if (trackIndex != null) {
-                                    muxer.writeSampleData(trackIndex, frame.buffer, bi)
-                                    LOGD("[ENCODER] -> [MUXER] ${frame.info.size} ${frame.info.offset} ${frame.info.presentationTimeUs}")
-                                    bytesWritten += frame.info.size
-                                    ++videoFramesWritten
+                                continue
+                            } else if (outVideoTrackIndex == null) {
+                                LOGD("[ENCODER] Config frame. Add output video track.")
+                                outVideoTrackIndex = muxer.addTrack(outputVideoFormat!!)
+                                muxer.setOrientationHint(videoRotationDeg)
+                                muxer.start()
+                                isMuxerStarted = true
+                            }
 
-                                    val percent =
-                                        frame.info.presentationTimeUs / totalDurationUs.toFloat()
-                                    send(VideoProcessingState.Processing(percent, thumbnailBitmap))
+                            if (doRender) {
+                                newFrameAvailableLock.receive()
+                                withContext(primaryDispatcher) {
+                                    renderVideoFrame()
+                                }
+                            }
+                        }
+
+                        while (true) {
+                            val frame = encodedVideoFrames.tryReceive().getOrNull() ?: break
+                            LOGE("ENCODED FRAME: $frame")
+                            when (frame) {
+                                EncodedVideoFrame.EndOfData -> {
+                                    isEncoderFinished = true
+                                    LOGD("[ENCODER-MUXER] COMPLETE")
+                                }
+
+                                is EncodedVideoFrame.DataFrame -> {
+                                    val bi = BufferInfo().apply {
+                                        presentationTimeUs = frame.info.presentationTimeUs
+                                        size = frame.info.size
+                                        flags = frame.info.flags
+                                        offset = frame.info.offset
+                                    }
+                                    val trackIndex = outVideoTrackIndex
+                                    if (trackIndex != null) {
+                                        muxer.writeSampleData(trackIndex, frame.buffer, bi)
+                                        LOGD("[ENCODER] -> [MUXER] ${frame.info.size} ${frame.info.offset} ${frame.info.presentationTimeUs}")
+                                        bytesWritten += frame.info.size
+                                        ++videoFramesWritten
+
+                                        val percent =
+                                            frame.info.presentationTimeUs / totalDurationUs.toFloat()
+                                        send(
+                                            VideoProcessingState.Processing(
+                                                percent,
+                                                thumbnailBitmap
+                                            )
+                                        )
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
+
+            send(VideoProcessingState.Done)
+
+            encoder.release()
+            decoder.release()
+
+            muxer.stop()
+            muxer.release()
+
+            LOGD("Processing finished. ${outputFile.absolutePath}")
+
+            LOGD("Bytes written=$bytesWritten")
+            LOGD("Video frames read=$videoFramesRead")
+            LOGD("Video frames written=$videoFramesWritten")
+            LOGD("Audio frames read=$audioFramesRead")
+            LOGD("Audio frames written=$audioFramesWritten")
+
+            val time = (System.currentTimeMillis() - startTime) / 1000f
+            LOGD("TIME = $time")
         }
-
-        send(VideoProcessingState.Done)
-
-        encoder.release()
-        decoder.release()
-
-        muxer.stop()
-        muxer.release()
-
-        LOGD("Processing finished. ${outputFile.absolutePath}")
-
-        LOGD("Bytes written=$bytesWritten")
-        LOGD("Video frames read=$videoFramesRead")
-        LOGD("Video frames written=$videoFramesWritten")
-        LOGD("Audio frames read=$audioFramesRead")
-        LOGD("Audio frames written=$audioFramesWritten")
-
-        val time = (System.currentTimeMillis() - startTime) / 1000f
-        LOGD("TIME = $time")
     }
 
     private fun renderVideoFrame() {
-        synchronized(globalRenderFrameLock) {
+        //synchronized(globalRenderFrameLock) {
             if (eglCore == null) {
                 LOGE("eglCore is not initialized. Skip frame!")
                 return
@@ -557,7 +581,7 @@ class VideoProcessor(
             }
 
             ++framesRendered
-        }
+     //   }
     }
 
     private suspend fun sendFinishToDecoder() {
