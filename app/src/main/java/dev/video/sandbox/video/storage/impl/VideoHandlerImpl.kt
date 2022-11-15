@@ -3,16 +3,14 @@ package dev.video.sandbox.video.storage.impl
 import android.content.Context
 import android.graphics.Bitmap
 import android.net.Uri
-import dev.video.sandbox.video.VideoProcessingState
 import dev.video.sandbox.video.VideoProcessor
-import dev.video.sandbox.video.storage.VideoState
 import dev.video.sandbox.video.storage.VideoHandler
+import dev.video.sandbox.video.storage.VideoState
 import dev.video.sandbox.video.storage.VideoStorage
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.launch
 import timber.log.Timber
 import java.io.File
@@ -108,36 +106,29 @@ internal class VideoHandlerImpl private constructor(
             withAudio = withAudio
         )
 
-        var latestState: VideoProcessingState? = null
+        var isErrorOccurred = false
         processor.process()
-            .flowOn(Dispatchers.Main) // TODO: do something with contexts
+            .catch {
+                Timber.e(it)
+                isErrorOccurred = true
+            }
             .collect { processingState ->
-                latestState = processingState
-                when (processingState) {
-                    is VideoProcessingState.Processing -> {
-                        cachedThumb = processingState.thumbBitmap
-                        state.value =
-                            VideoState.Processing.InProgress(
-                                processingState.progress,
-                                processingState.thumbBitmap
-                            )
-                    }
-
-                    VideoProcessingState.Done -> {
-
-                    }
-                }
+                cachedThumb = processingState.thumbBitmap
+                state.value =
+                    VideoState.Processing.InProgress(
+                        processingState.progress,
+                        processingState.thumbBitmap
+                    )
             }
 
-        return when (latestState) {
-            VideoProcessingState.Done -> outputFile
-            else -> {
-                if (outputFile.exists()) {
-                    outputFile.delete()
-                }
-                throw RuntimeException("Error processing video")
+        if (isErrorOccurred) {
+            if (outputFile.exists()) {
+                outputFile.delete()
             }
+            throw RuntimeException("Error processing video")
         }
+
+        return outputFile
     }
 
 }

@@ -26,24 +26,27 @@ import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.cancellable
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import timber.log.Timber
 import java.io.File
 import java.nio.ByteBuffer
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 
 
-sealed interface VideoProcessingState {
-    data class Processing(val progress: Float, val thumbBitmap: Bitmap?) : VideoProcessingState
-    object Done : VideoProcessingState
-}
+data class VideoProcessingState(val progress: Float, val thumbBitmap: Bitmap?)
 
 class VideoProcessor(
-    context: Context,
+    context: Context? = null,
     private val scope: CoroutineScope = CoroutineScope(Dispatchers.IO),
-    private val inputUri: Uri,
+    private val inputUri: Uri? = null,
+    private val inputFile: File? = null,
     private val outputFile: File,
     private val withAudio: Boolean
 ) {
@@ -58,8 +61,6 @@ class VideoProcessor(
 
         private const val TAG = "VideoProcessor"
         private const val DEBUG = true
-
-        private val globalRenderFrameLock = Any()
 
         @SuppressLint("LogNotTimber")
         fun LOGE(th: Throwable, msg: String) {
@@ -182,7 +183,11 @@ class VideoProcessor(
     private var outputVideoFormat: MediaFormat? = null
 
     init {
-        extractor.setDataSource(context, inputUri, null)
+        if (context != null && inputUri != null) {
+            extractor.setDataSource(context, inputUri, null)
+        } else {
+            extractor.setDataSource(inputFile!!.absolutePath)
+        }
     }
 
     private val decoderCallback = object : MediaCodec.Callback() {
@@ -287,7 +292,7 @@ class VideoProcessor(
         // TODO
     }
 
-    fun process() = channelFlow<VideoProcessingState> {
+    fun process() = channelFlow {
         val startTime = System.currentTimeMillis()
 
         val videoInfo = extractor.pickMediaTrackInfo("video/")
@@ -314,9 +319,6 @@ class VideoProcessor(
 
         var outAudioTrackIndex: Int? = null
         var outVideoTrackIndex: Int? = null
-        if (audioInfo != null) {
-            outAudioTrackIndex = muxer.addTrack(audioInfo.format)
-        }
 
         val desiredOutputVideoFormat =
             MediaFormat.createVideoFormat(
@@ -379,8 +381,8 @@ class VideoProcessor(
         var videoFramesWritten = 0
         var bytesWritten = 0L
         var videoFramesRead = 0
-        var audioFramesRead = 0
-        var audioFramesWritten = 0
+        val audioFramesRead = AtomicInteger(0)
+        val audioFramesWritten = AtomicInteger(0)
 
         var isEncoderFinished = false
         var isDecoderFinished = false
@@ -412,31 +414,16 @@ class VideoProcessor(
                             this.presentationTimeUs = presentationTimeUs
                             this.size = dataSize
                         }
-                        ++audioFramesRead
-                        audioFrames.send(AudioFrame(extractorBuffer.deepCopyData(), audioBufferInfo))
+                        audioFramesRead.incrementAndGet()
+                        audioFrames.send(
+                            AudioFrame(
+                                extractorBuffer.deepCopyData(),
+                                audioBufferInfo
+                            )
+                        )
                     }
 
                     extractor.advance()
-                }
-            }
-
-            // Write audio
-            if (withAudio) {
-                launch(Dispatchers.IO) {
-                    while (!isDecoderFinished) {
-                        val audioFrame = audioFrames.tryReceive().getOrNull()
-                        if (audioFrame != null && isMuxerStarted && outAudioTrackIndex != null) {
-                            muxer.writeSampleData(
-                                outAudioTrackIndex,
-                                audioFrame.buffer,
-                                audioFrame.info
-                            )
-                            ++audioFramesWritten
-                        } else {
-                            LOGE("AUDIO DELAY")
-                            delay(10)
-                        }
-                    }
                 }
             }
 
@@ -472,6 +459,10 @@ class VideoProcessor(
                         } else if (outputVideoFormat != null && outVideoTrackIndex == null) {
                             LOGD("[ENCODER] Config frame. Add output video track.")
                             outVideoTrackIndex = muxer.addTrack(outputVideoFormat!!)
+                            if (audioInfo != null) {
+                                outAudioTrackIndex = muxer.addTrack(audioInfo.format)
+                            }
+
                             muxer.setOrientationHint(videoRotationDeg)
                             muxer.start()
                             isMuxerStarted = true
@@ -481,6 +472,19 @@ class VideoProcessor(
                             newFrameAvailableLock.receive()
                             withContext(primaryDispatcher) {
                                 renderVideoFrame()
+                            }
+                        }
+
+                        if (isMuxerStarted && outAudioTrackIndex != null) {
+                            var audioFrame = audioFrames.tryReceive().getOrNull()
+                            while (audioFrame != null) {
+                                muxer.writeSampleData(
+                                    outAudioTrackIndex!!,
+                                    audioFrame.buffer,
+                                    audioFrame.info
+                                )
+                                audioFramesWritten.incrementAndGet()
+                                audioFrame = audioFrames.tryReceive().getOrNull()
                             }
                         }
                     }
@@ -511,7 +515,7 @@ class VideoProcessor(
                                     val percent =
                                         frame.info.presentationTimeUs / totalDurationUs.toFloat()
                                     send(
-                                        VideoProcessingState.Processing(
+                                        VideoProcessingState(
                                             percent,
                                             thumbnailBitmap
                                         )
@@ -524,24 +528,22 @@ class VideoProcessor(
             }
         }
 
-        send(VideoProcessingState.Done)
-
         encoder.release()
         decoder.release()
 
         muxer.stop()
         muxer.release()
 
-        LOGD("Processing finished. ${outputFile.absolutePath}")
+        Timber.d("Processing finished. ${outputFile.absolutePath}")
 
-        LOGD("Bytes written=$bytesWritten")
-        LOGD("Video frames read=$videoFramesRead")
-        LOGD("Video frames written=$videoFramesWritten")
-        LOGD("Audio frames read=$audioFramesRead")
-        LOGD("Audio frames written=$audioFramesWritten")
+        Timber.d("Bytes written=$bytesWritten")
+        Timber.d("Video frames read=$videoFramesRead")
+        Timber.d("Video frames written=$videoFramesWritten")
+        Timber.d("Audio frames read=${audioFramesRead.get()}")
+        Timber.d("Audio frames written=${audioFramesWritten.get()}")
 
         val time = (System.currentTimeMillis() - startTime) / 1000f
-        LOGD("TIME = $time")
+        Timber.d("TIME = $time")
     }.flowOn(primaryDispatcher)
 
     private fun renderVideoFrame() {

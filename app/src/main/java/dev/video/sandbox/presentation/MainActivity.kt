@@ -1,12 +1,16 @@
 package dev.video.sandbox.presentation
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import dev.video.sandbox.video.VideoProcessor
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -29,8 +33,44 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        checkWritePermisstion()
+
         setContent {
             MainScreen(viewModel, onPickImageClick = ::pickVideo )
+        }
+    }
+
+    private val requestPermissionLauncher =
+        registerForActivityResult(
+            ActivityResultContracts.RequestPermission()
+        ) { isGranted: Boolean ->
+            if (isGranted) {
+                // Permission is granted. Continue the action or workflow in your
+                // app.
+            } else {
+                // Explain to the user that the feature is unavailable because the
+                // feature requires a permission that the user has denied. At the
+                // same time, respect the user's decision. Don't link to system
+                // settings in an effort to convince the user to change their
+                // decision.
+            }
+        }
+    private fun checkWritePermisstion() {
+        when {
+            ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.WRITE_EXTERNAL_STORAGE
+            ) == PackageManager.PERMISSION_GRANTED -> {
+
+            }
+            shouldShowRequestPermissionRationale(Manifest.permission.WRITE_EXTERNAL_STORAGE) -> {
+        }
+            else -> {
+                // You can directly ask for the permission.
+                // The registered ActivityResultCallback gets the result of this request.
+                requestPermissionLauncher.launch(
+                    Manifest.permission.WRITE_EXTERNAL_STORAGE)
+            }
         }
     }
 
@@ -56,8 +96,8 @@ class MainActivity : AppCompatActivity() {
                 if (selectedUri != null) {
                     MainScope().launch {
                         //         delay(2000)
-                        //testProcess(selectedUri)
-                        viewModel.sendVideo(selectedUri, false)
+                        testProcess(selectedUri)
+                        //viewModel.sendVideo(selectedUri, true)
                     }
                 }
             }
@@ -81,10 +121,9 @@ class MainActivity : AppCompatActivity() {
         }
 
         videoProcessor = VideoProcessor(this,
-            CoroutineScope(Dispatchers.Main),
-            contentUri,
-            outputPath,
-            true)
+            inputUri = contentUri,
+            outputFile = outputPath,
+            withAudio = true)
         GlobalScope.launch {
             videoProcessor?.process()?.flowOn(Dispatchers.Main)?.collect()
         }
