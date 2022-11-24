@@ -1,9 +1,11 @@
 package dev.video.sandbox.video
 
+import android.content.Context
 import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.media.MediaExtractor
 import android.media.MediaFormat
+import android.net.Uri
 import android.os.Build
 import timber.log.Timber
 import java.nio.ByteBuffer
@@ -39,6 +41,16 @@ fun selectCodec(mimeType: String): MediaCodecInfo? {
         }
     }
     return null
+}
+
+fun dumpTracks(context: Context, uri: Uri) {
+    val extractor = MediaExtractor()
+    extractor.setDataSource(context, uri, null)
+    for (t in 0 until extractor.trackCount) {
+        dumpTrack(extractor, t)
+    }
+
+    extractor.release()
 }
 
 fun dumpTrack(extractor: MediaExtractor, i: Int) {

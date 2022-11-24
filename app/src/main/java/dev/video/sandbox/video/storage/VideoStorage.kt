@@ -55,6 +55,7 @@ class VideoStorage(
 
     init {
         clearDir(tempProcessingDir)
+        clearDir(storageDir)
     }
 
     fun clearAll() {

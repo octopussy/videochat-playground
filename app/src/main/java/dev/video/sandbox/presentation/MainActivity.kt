@@ -12,13 +12,15 @@ import androidx.activity.viewModels
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import dev.video.sandbox.video.VideoProcessor
-import kotlinx.coroutines.CoroutineScope
+import dev.video.sandbox.video.dumpTracks
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.MainScope
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.launch
+import timber.log.Timber
 import java.io.File
 
 
@@ -74,7 +76,12 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun pickVideo2() {
+        testProcess(Uri.parse("content://com.android.providers.media.documents/document/video%3A1000000720"))
+    }
+
     private fun pickVideo() {
+
         val intent = Intent().apply {
             type = "video/*"
             action = Intent.ACTION_GET_CONTENT
@@ -96,8 +103,8 @@ class MainActivity : AppCompatActivity() {
                 if (selectedUri != null) {
                     MainScope().launch {
                         //         delay(2000)
-                        testProcess(selectedUri)
-                        //viewModel.sendVideo(selectedUri, true)
+                       // testProcess(selectedUri)
+                        viewModel.sendVideo(selectedUri, true)
                     }
                 }
             }
@@ -120,12 +127,16 @@ class MainActivity : AppCompatActivity() {
             outputPath.delete()
         }
 
-        videoProcessor = VideoProcessor(this,
+        val videoProcessor = VideoProcessor(this,
             inputUri = contentUri,
             outputFile = outputPath,
             withAudio = true)
         GlobalScope.launch {
-            videoProcessor?.process()?.flowOn(Dispatchers.Main)?.collect()
+            videoProcessor.process()?.flowOn(Dispatchers.Main)?.catch {
+                Timber.e(it, "ERROR PROESSING")
+            }?.collect()
+
+            dumpTracks(this@MainActivity, Uri.fromFile(outputPath))
         }
     }
 

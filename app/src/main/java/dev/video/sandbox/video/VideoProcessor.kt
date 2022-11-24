@@ -1,6 +1,5 @@
 package dev.video.sandbox.video
 
-import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.SurfaceTexture
@@ -13,24 +12,20 @@ import android.media.MediaMuxer
 import android.media.MediaMuxer.OutputFormat
 import android.net.Uri
 import android.opengl.GLES20
-import android.util.Log
 import android.view.Surface
 import grafika.gles.EglCore
 import grafika.gles.FullFrameRectLetterbox
 import grafika.gles.Texture2dProgram
 import grafika.gles.WindowSurface
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.cancellable
-import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.flow.flowOn
-import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import timber.log.Timber
@@ -57,29 +52,26 @@ class VideoProcessor(
         private const val ENCODE_HEIGHT = 720
         private const val ENCODE_BITRATE = 2_000_000
         private const val ENCODE_MAX_FRAME_RATE = 30
-        private const val ENCODE_I_FRAME_INTERVAL = 10
+        private const val ENCODE_I_FRAME_INTERVAL = 2
 
         private const val TAG = "VideoProcessor"
         private const val DEBUG = true
 
-        @SuppressLint("LogNotTimber")
         fun LOGE(th: Throwable, msg: String) {
             if (DEBUG) {
-                Log.e(TAG, msg, th)
+                Timber.tag(TAG).e(th, msg)
             }
         }
 
-        @SuppressLint("LogNotTimber")
         fun LOGE(msg: String) {
             if (DEBUG) {
-                Log.e(TAG, msg)
+                Timber.tag(TAG).e(msg)
             }
         }
 
-        @SuppressLint("LogNotTimber")
         fun LOGD(msg: String) {
             if (DEBUG) {
-                Log.d(TAG, msg)
+                Timber.tag(TAG).d(msg)
             }
         }
     }
@@ -90,7 +82,10 @@ class VideoProcessor(
     private lateinit var decoder: MediaCodec
     private lateinit var encoder: MediaCodec
     private lateinit var muxer: MediaMuxer
+    private var isExtractorStarted = false
     private var isMuxerStarted = false
+    private var isEncoderStarted = false
+    private var isDecoderStarted = false
 
     private var eglCore: EglCore? = null
     private var frameBlit: FullFrameRectLetterbox? = null
@@ -101,11 +96,12 @@ class VideoProcessor(
     private var inputSurface: Surface? = null
     private val tempMatrix = FloatArray(16)
 
-    private var videoRotationDeg: Int = 0
+    private var inputVideoRotationDeg: Int = 0
 
     private val takeSnapshotCallbackLock = Any()
     private var takeSnapshotCallback: ((Bitmap) -> Unit)? = null
     private var framesRendered = 0
+    private var lastVideoFramePTU = 0L
 
     private data class InputBufferEntry(
         val codec: MediaCodec,
@@ -171,6 +167,8 @@ class VideoProcessor(
         onBufferOverflow = BufferOverflow.DROP_OLDEST
     )
 
+    private var occurredError: Throwable? = null
+
     private val newFrameAvailableLock = Channel<Unit>()
     private val newDryFrameAvailableLock = Channel<Unit>()
 
@@ -188,10 +186,13 @@ class VideoProcessor(
         } else {
             extractor.setDataSource(inputFile!!.absolutePath)
         }
+
+        isExtractorStarted = true
     }
 
     private val decoderCallback = object : MediaCodec.Callback() {
         override fun onInputBufferAvailable(codec: MediaCodec, index: Int) {
+            if (!isDecoderStarted) return
             val buffer = codec.getInputBuffer(index)
                 ?: throw IllegalStateException("input buffer is null")
 
@@ -207,6 +208,7 @@ class VideoProcessor(
             index: Int,
             info: BufferInfo
         ) {
+            if (!isDecoderStarted) return
             val isConfig = info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0
             val isFinished = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
 
@@ -228,6 +230,7 @@ class VideoProcessor(
 
         override fun onError(codec: MediaCodec, exception: MediaCodec.CodecException) {
             LOGE(exception, "DECODER ERROR")
+            occurredError = exception
         }
 
         override fun onOutputFormatChanged(codec: MediaCodec, format: MediaFormat) {
@@ -236,12 +239,11 @@ class VideoProcessor(
 
     private val encoderCallback = object : MediaCodec.Callback() {
         override fun onInputBufferAvailable(codec: MediaCodec, index: Int) {
+            if (!isEncoderStarted) return
             val buffer = codec.getInputBuffer(index)
                 ?: throw IllegalStateException("input buffer is null")
 
             buffer.clear()
-
-            LOGD("ENCODER input buffer ready \tid=$index")
 
             scope.launch {
                 encoderInputBuffers.send(InputBufferEntry(codec, index, buffer))
@@ -253,6 +255,7 @@ class VideoProcessor(
             index: Int,
             info: BufferInfo
         ) {
+            if (!isEncoderStarted) return
             val buffer = codec.getOutputBuffer(index)
                 ?: throw IllegalStateException("output buffer is null")
 
@@ -262,7 +265,6 @@ class VideoProcessor(
                 }
 
                 else -> {
-                    LOGD("ENCODER DATA FRAME ${info.presentationTimeUs}")
                     EncodedVideoFrame.DataFrame(
                         buffer = buffer.deepCopyData(),
                         info = info
@@ -274,12 +276,12 @@ class VideoProcessor(
                 encodedVideoFrames.send(frame)
             }
 
-            LOGD("ENCODER frame ready: \tid=$index size=${info.size} ptu=${info.presentationTimeUs}")
             codec.releaseOutputBuffer(index, false)
         }
 
         override fun onError(codex: MediaCodec, exception: MediaCodec.CodecException) {
             LOGE(exception, "ENCODER ERROR")
+            occurredError = exception
         }
 
         override fun onOutputFormatChanged(codec: MediaCodec, format: MediaFormat) {
@@ -289,7 +291,29 @@ class VideoProcessor(
     }
 
     fun release() {
-        // TODO
+        LOGD("Releasing")
+        if (::encoder.isInitialized && isEncoderStarted) {
+            encoder.stop()
+            encoder.release()
+            isEncoderStarted = false
+        }
+        if (::decoder.isInitialized && isDecoderStarted) {
+            decoder.stop()
+            decoder.release()
+            isDecoderStarted = false
+        }
+
+        if (isExtractorStarted) {
+            extractor.release()
+            isExtractorStarted = false
+        }
+
+        encoderWindowSurface?.release()
+        encoderWindowSurface = null
+        inputTexture?.release()
+        inputTexture = null
+        eglCore?.release()
+        eglCore = null
     }
 
     fun process() = channelFlow {
@@ -302,17 +326,16 @@ class VideoProcessor(
 
         inputWidth = videoInfo.format.getInteger(MediaFormat.KEY_WIDTH)
         inputHeight = videoInfo.format.getInteger(MediaFormat.KEY_HEIGHT)
-        outputWidth = ENCODE_WIDTH
-        outputHeight = ENCODE_HEIGHT
+        inputVideoRotationDeg = videoInfo.format.getRotationDeg()
 
-        videoRotationDeg = videoInfo.format.getRotationDeg()
+        calcOutputVideoParams()
 
         extractor.selectTrack(videoInfo.trackIndex)
 
         val audioInfo = if (withAudio) {
             extractor.pickMediaTrackInfo("audio/")?.also {
                 extractor.selectTrack(it.trackIndex)
-            } ?: throw IllegalStateException("Missing audio track for '$inputUri'")
+            }
         } else {
             null
         }
@@ -350,6 +373,7 @@ class VideoProcessor(
         encoderWindowSurface = WindowSurface(eglCore, encoderSurface, false)
         encoderWindowSurface!!.makeCurrent()
         encoder.start()
+        isEncoderStarted = true
 
         frameBlit = FullFrameRectLetterbox(
             Texture2dProgram(Texture2dProgram.ProgramType.TEXTURE_EXT)
@@ -375,6 +399,7 @@ class VideoProcessor(
         decoder.setCallback(decoderCallback)
         decoder.configure(videoInfo.format, inputSurface, null, 0)
         decoder.start()
+        isDecoderStarted = true
 
         val extractorBuffer = ByteBuffer.allocate(0xffffff)
 
@@ -387,7 +412,13 @@ class VideoProcessor(
         var isEncoderFinished = false
         var isDecoderFinished = false
 
-        coroutineScope {
+        val handler = CoroutineExceptionHandler { _, exception ->
+            Timber.e("CoroutineExceptionHandler got $exception")
+            occurredError = exception
+        }
+
+        val workerScope = CoroutineScope(Job() + handler)
+        val workerJob = workerScope.launch {
             var thumbnailBitmap: Bitmap? = null
             takeSnapshotCallback = {
                 thumbnailBitmap = it
@@ -409,7 +440,7 @@ class VideoProcessor(
                     if (trackIndex == videoInfo.trackIndex) {
                         submitDataToDecoder(extractorBuffer, dataSize, presentationTimeUs)
                         ++videoFramesRead
-                    } else if (audioInfo != null && outAudioTrackIndex != null && trackIndex == audioInfo.trackIndex) {
+                    } else if (trackIndex == audioInfo?.trackIndex) {
                         val audioBufferInfo = BufferInfo().apply {
                             this.presentationTimeUs = presentationTimeUs
                             this.size = dataSize
@@ -431,15 +462,16 @@ class VideoProcessor(
             launch(Dispatchers.IO) {
                 while (!isEncoderFinished) {
                     if (!isDecoderFinished) {
-                        var doRender = false
+                        var awaitingDecodedVideoFrame = false
                         when (val decodedFrame = decodedVideoFrames.receive()) {
                             is DecodedVideoFrame.Data -> {
                                 LOGD(
                                     "decodedFrame:  data = ${decodedFrame.info.size} " +
                                             "${decodedFrame.info.presentationTimeUs}"
                                 )
+                                // send it to renderer, awaiting via newFrameAvailableLock
                                 decodedFrame.codec.releaseOutputBuffer(decodedFrame.index, true)
-                                doRender = true
+                                awaitingDecodedVideoFrame = true
                             }
 
                             DecodedVideoFrame.Finished -> {
@@ -453,7 +485,7 @@ class VideoProcessor(
                             LOGD("WAITING RESULT VIDEO FORMAT")
                             newDryFrameAvailableLock.receive()
                             withContext(primaryDispatcher) {
-                                renderVideoFrame()
+                                renderDecodedVideoFrameToEncoder()
                             }
                             continue
                         } else if (outputVideoFormat != null && outVideoTrackIndex == null) {
@@ -463,15 +495,15 @@ class VideoProcessor(
                                 outAudioTrackIndex = muxer.addTrack(audioInfo.format)
                             }
 
-                            muxer.setOrientationHint(videoRotationDeg)
+                            //muxer.setOrientationHint(inputVideoRotationDeg)
                             muxer.start()
                             isMuxerStarted = true
                         }
 
-                        if (doRender) {
+                        if (awaitingDecodedVideoFrame) {
                             newFrameAvailableLock.receive()
                             withContext(primaryDispatcher) {
-                                renderVideoFrame()
+                                renderDecodedVideoFrameToEncoder()
                             }
                         }
 
@@ -489,6 +521,7 @@ class VideoProcessor(
                         }
                     }
 
+                    // write all available encoded video frames at this time
                     while (true) {
                         val frame = encodedVideoFrames.tryReceive().getOrNull() ?: break
                         LOGE("ENCODED FRAME: $frame")
@@ -512,8 +545,7 @@ class VideoProcessor(
                                     bytesWritten += frame.info.size
                                     ++videoFramesWritten
 
-                                    val percent =
-                                        frame.info.presentationTimeUs / totalDurationUs.toFloat()
+                                    val percent = frame.info.presentationTimeUs / totalDurationUs.toFloat()
                                     send(
                                         VideoProcessingState(
                                             percent,
@@ -528,11 +560,18 @@ class VideoProcessor(
             }
         }
 
-        encoder.release()
-        decoder.release()
+        workerJob.join()
 
-        muxer.stop()
-        muxer.release()
+        if (isDecoderFinished && isEncoderFinished && occurredError == null) {
+            muxer.stop()
+            muxer.release()
+        }
+
+        release()
+
+        if (occurredError != null) {
+            throw occurredError!!
+        }
 
         Timber.d("Processing finished. ${outputFile.absolutePath}")
 
@@ -546,7 +585,30 @@ class VideoProcessor(
         Timber.d("TIME = $time")
     }.flowOn(primaryDispatcher)
 
-    private fun renderVideoFrame() {
+    private fun calcOutputVideoParams() {
+        outputWidth = ENCODE_WIDTH
+        outputHeight = ENCODE_HEIGHT
+
+        // 0.45
+        // 0.5625
+        val (rotatedInputWidth, rotatedInputHeight) = when (inputVideoRotationDeg) {
+            270, 90 -> {
+                inputHeight to inputWidth
+            }
+            else -> inputWidth to inputHeight
+        }
+
+        val isOriginalInPortrait = rotatedInputHeight > rotatedInputWidth
+        if (isOriginalInPortrait) {
+            outputWidth = ENCODE_HEIGHT
+            outputHeight = ENCODE_WIDTH
+        } else {
+            outputWidth = ENCODE_WIDTH
+            outputHeight = ENCODE_HEIGHT
+        }
+    }
+
+    private fun renderDecodedVideoFrameToEncoder() {
         if (eglCore == null) {
             LOGE("eglCore is not initialized. Skip frame!")
             return
@@ -560,7 +622,7 @@ class VideoProcessor(
         encoderWindowSurface!!.makeCurrent()
         GLES20.glViewport(0, 0, outputWidth, outputHeight)
 
-        frameBlit!!.drawFrameY(inputTextureId, tempMatrix, videoRotationDeg, 1f)
+        frameBlit!!.drawFrameY(inputTextureId, tempMatrix, 0, 1f)
         encoderWindowSurface!!.setPresentationTime(inputTexture!!.timestamp)
         encoderWindowSurface!!.swapBuffers()
 
@@ -569,7 +631,7 @@ class VideoProcessor(
                 if (takeSnapshotCallback != null) {
                     Thread.sleep(50)
                     val bmp =
-                        makeBitmapFromGlPixels(outputWidth, outputHeight, videoRotationDeg)
+                        makeBitmapFromGlPixels(outputWidth, outputHeight, 0)
                     takeSnapshotCallback?.invoke(bmp)
                     takeSnapshotCallback = null
                 }
