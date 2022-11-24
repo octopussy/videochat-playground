@@ -545,7 +545,8 @@ class VideoProcessor(
                                     bytesWritten += frame.info.size
                                     ++videoFramesWritten
 
-                                    val percent = frame.info.presentationTimeUs / totalDurationUs.toFloat()
+                                    val percent =
+                                        frame.info.presentationTimeUs / totalDurationUs.toFloat()
                                     send(
                                         VideoProcessingState(
                                             percent,
@@ -589,12 +590,8 @@ class VideoProcessor(
         outputWidth = ENCODE_WIDTH
         outputHeight = ENCODE_HEIGHT
 
-        // 0.45
-        // 0.5625
         val (rotatedInputWidth, rotatedInputHeight) = when (inputVideoRotationDeg) {
-            270, 90 -> {
-                inputHeight to inputWidth
-            }
+            270, 90 -> inputHeight to inputWidth
             else -> inputWidth to inputHeight
         }
 
@@ -622,7 +619,19 @@ class VideoProcessor(
         encoderWindowSurface!!.makeCurrent()
         GLES20.glViewport(0, 0, outputWidth, outputHeight)
 
-        frameBlit!!.drawFrameY(inputTextureId, tempMatrix, 0, 1f)
+        val inputRatio = inputHeight / inputWidth.toFloat()
+        val outputRatio = outputHeight / outputWidth.toFloat()
+
+        if (inputRatio > outputRatio) {
+            // pillar box
+            val scale = (inputWidth * (outputHeight / inputHeight.toFloat())) / outputWidth
+            frameBlit!!.drawFrameX(inputTextureId, tempMatrix, 0, scale)
+        } else {
+            // letter box
+            val scale = (inputHeight * (outputWidth / inputWidth.toFloat())) / outputHeight
+            frameBlit!!.drawFrameY(inputTextureId, tempMatrix, 0, scale)
+        }
+
         encoderWindowSurface!!.setPresentationTime(inputTexture!!.timestamp)
         encoderWindowSurface!!.swapBuffers()
 
